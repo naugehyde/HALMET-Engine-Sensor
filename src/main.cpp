@@ -21,6 +21,7 @@
 #include "sensesp/signalk/signalk_output.h"
 #include "sensesp/system/lambda_consumer.h"
 #include "sensesp/system/system_status_led.h"
+#include "sensesp/transforms/curveinterpolator.h"
 #include "sensesp/transforms/lambda_transform.h"
 #include "sensesp/transforms/linear.h"
 #include "sensesp/ui/config_item.h"
@@ -94,7 +95,7 @@ void setup() {
   BUILDER_CLASS builder;
   sensesp_app = (&builder)
                     // EDIT: Set a custom hostname for the app.
-                    ->set_hostname("halmet")
+                    ->set_hostname("halriot")
                     // EDIT: Optionally, hard-code the WiFi and Signal K server
                     // settings. This is normally not needed.
                     //->set_wifi("My WiFi SSID", "my_wifi_password")
@@ -231,6 +232,64 @@ void setup() {
   //                       new SKMetadata("m", "Analog Distance A2")));
 
   ///////////////////////////////////////////////////////////////////
+  // Oil pressure sender on analog input A3 (ADS1115 channel 2).
+  //
+  // This expects a US-standard resistive oil pressure sender (VDO /
+  // Stewart-Warner style) with a nominal range of 240 ohms at 0 psi
+  // down to ~33 ohms at 80 psi. The HALMET analog front-end drives the
+  // sender with a constant ~10 mA current, so the sender resistance is
+  // computed from the measured voltage.
+  constexpr float kOilPressureMeasurementCurrent = 0.01f;  // A
+
+  auto oil_pressure_resistance =
+      new RepeatSensor<float>(500, [ads1115]() {
+        int16_t adc_output = ads1115->readADC_SingleEnded(2);
+        float adc_output_volts = ads1115->computeVolts(adc_output);
+        return kVoltageDividerScale * adc_output_volts /
+               kOilPressureMeasurementCurrent;
+      });
+
+  // Piecewise linear curve mapping sender resistance (ohms) to oil
+  // pressure (Pa). Defaults match a US-standard 240-33 ohm sender with
+  // a linear 0-80 psi range. The curve is editable from the web UI.
+  auto oil_pressure_curve = (new CurveInterpolator(
+                                 nullptr, "/Engine/Oil Pressure/Curve"))
+                                ->set_input_title("Sender Resistance (ohms)")
+                                ->set_output_title("Oil Pressure (Pa)");
+
+  ConfigItem(oil_pressure_curve)
+      ->set_title("Oil Pressure Curve")
+      ->set_description(
+          "Piecewise linear curve mapping sender resistance (ohms) to oil "
+          "pressure (Pa). Default: US-standard 240-33 ohm, 0-80 psi sender.")
+      ->set_sort_order(3020);
+
+  if (oil_pressure_curve->get_samples().empty()) {
+    // psi to Pa: 1 psi = 6894.757 Pa
+    oil_pressure_curve->clear_samples();
+    oil_pressure_curve->add_sample(
+        CurveInterpolator::Sample(240.0f, 0.0f));
+    oil_pressure_curve->add_sample(
+        CurveInterpolator::Sample(103.0f, 40.0f * 6894.757f));
+    oil_pressure_curve->add_sample(
+        CurveInterpolator::Sample(33.0f, 80.0f * 6894.757f));
+    oil_pressure_curve->add_sample(
+        CurveInterpolator::Sample(0.0f, 100.0f * 6894.757f));
+  }
+
+  oil_pressure_resistance->connect_to(oil_pressure_curve);
+
+  // Publish raw sender resistance and converted pressure to Signal K.
+  oil_pressure_resistance->connect_to(new SKOutputFloat(
+      "propulsion.main.oilPressure.senderResistance",
+      "/Engine/Oil Pressure/Sender Resistance SK Path",
+      new SKMetadata("ohm", "Oil Pressure Sender Resistance")));
+
+  oil_pressure_curve->connect_to(new SKOutputFloat(
+      "propulsion.main.oilPressure", "/Engine/Oil Pressure/SK Path",
+      new SKMetadata("Pa", "Engine Oil Pressure")));
+
+  ///////////////////////////////////////////////////////////////////
   // Digital alarm inputs
 
   // EDIT: More alarm inputs can be defined by duplicating the lines below.
@@ -267,6 +326,13 @@ void setup() {
   // This is just an example -- normally temperature alarms would not be
   // active-low (inverted).
   alarm_d3_inverted->connect_to(engine_dynamic_sender->over_temperature_);
+
+  // Feed the A3 oil pressure measurement (Pa) into the NMEA 2000
+  // dynamic engine parameter sender (PGN 127489) for engine instance 0.
+  oil_pressure_curve
+      ->connect_to(new LambdaTransform<float, double>(
+          [](float value) { return static_cast<double>(value); }))
+      ->connect_to(engine_dynamic_sender->oil_pressure_);
 
   // FIXME: Transmit the alarms over SK as well.
 
