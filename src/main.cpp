@@ -101,7 +101,7 @@ void setup() {
                     //->set_wifi("My WiFi SSID", "my_wifi_password")
                     //->set_sk_server("192.168.10.3", 80)
                     // EDIT: Enable OTA updates with a password.
-                    //->enable_ota("my_ota_password")
+                    //->enable_ota("my_ota_  word")
                     ->get_app();
 
   // initialize the I2C bus
@@ -176,13 +176,27 @@ void setup() {
 
   bool enable_signalk_output = true;
 
+  // HALMET's analog inputs share a fixed hardware voltage divider (default
+  // 33.3/3.3). Expose it as a user-configurable value in the web UI in case
+  // a board revision or component tolerances require adjustment.
+  auto voltage_divider_scale =
+      new VoltageDividerScale("/Analog Inputs/Voltage Divider Scale");
+
+  ConfigItem(voltage_divider_scale)
+      ->set_title("Analog Input Voltage Divider Scale")
+      ->set_description(
+          "HALMET analog input hardware voltage divider ratio (default "
+          "33.3/3.3)")
+      ->set_sort_order(2990);
+
   // Connect the tank senders.
   // EDIT: To enable more tanks, uncomment the lines below.
-  auto tank_a1_volume = ConnectTankSender(ads1115, 0, "Fuel", "fuel.main", 3000,
-                                          enable_signalk_output);
-  // auto tank_a2_volume = ConnectTankSender(ads1115, 1, "A2");
-  // auto tank_a3_volume = ConnectTankSender(ads1115, 2, "A3");
-  // auto tank_a4_volume = ConnectTankSender(ads1115, 3, "A4");
+  auto tank_a1_volume =
+      ConnectTankSender(ads1115, 0, "Fuel", "fuel.main", 3000,
+                        voltage_divider_scale, enable_signalk_output);
+  // auto tank_a2_volume = ConnectTankSender(ads1115, 1, "A2", "tanks.a2", 3010, voltage_divider_scale);
+  // auto tank_a3_volume = ConnectTankSender(ads1115, 2, "A3", "tanks.a3", 3020, voltage_divider_scale);
+  // auto tank_a4_volume = ConnectTankSender(ads1115, 3, "A4", "tanks.a4", 3030, voltage_divider_scale);
 
 #ifdef ENABLE_NMEA2000_OUTPUT
   // Tank 1, instance 0. Capacity 200 liters. You can change the capacity
@@ -205,31 +219,64 @@ void setup() {
         [](float value) { PrintValue(display, 2, "Tank A1", 100 * value); }));
   }
 
-  // Read the voltage level of analog input A2
-  auto a2_voltage = new ADS1115VoltageInput(ads1115, 1, "/Voltage A2");
+  ///////////////////////////////////////////////////////////////////
+  // Coolant temperature sender on analog input A2 (ADS1115 channel 1).
+  //
+  // This expects a US-standard resistive temperature sender (Faria /
+  // Stewart-Warner style) with a nominal range of ~450 ohms at 100 F
+  // down to ~29 ohms at 250 F. The HALMET analog front-end drives the
+  // sender with a constant ~10 mA current, so the sender resistance is
+  // computed from the measured voltage.
+  constexpr float kCoolantTempMeasurementCurrent = 0.01f;  // A
 
-  ConfigItem(a2_voltage)
-      ->set_title("Analog Voltage A2")
-      ->set_description("Voltage level of analog input A2")
-      ->set_sort_order(3000);
+  auto coolant_temp_resistance = new RepeatSensor<float>(
+      500, [ads1115, voltage_divider_scale]() {
+        int16_t adc_output = ads1115->readADC_SingleEnded(1);
+        float adc_output_volts = ads1115->computeVolts(adc_output);
+        return voltage_divider_scale->scale * adc_output_volts /
+               kCoolantTempMeasurementCurrent;
+      });
 
-  a2_voltage->connect_to(new LambdaConsumer<float>(
-      [](float value) { debugD("Voltage A2: %f", value); }));
+  // Piecewise linear curve mapping sender resistance (ohms) to coolant
+  // temperature (Kelvin). Defaults match a US-standard 450-29 ohm sender
+  // with a 100-250 F range. The curve is editable from the web UI.
+  auto coolant_temp_curve =
+      (new CurveInterpolator(nullptr, "/Engine/Coolant Temperature/Curve"))
+          ->set_input_title("Sender Resistance (ohms)")
+          ->set_output_title("Coolant Temperature (K)");
 
-  // If you want to output something else than the voltage value,
-  // you can insert a suitable transform here.
-  // For example, to convert the voltage to a distance with a conversion
-  // factor of 0.17 m/V, you could use the following code:
-  // auto a2_distance = new Linear(0.17, 0.0);
-  // a2_voltage->connect_to(a2_distance);
+  ConfigItem(coolant_temp_curve)
+      ->set_title("Coolant Temperature Curve")
+      ->set_description(
+          "Piecewise linear curve mapping sender resistance (ohms) to "
+          "coolant temperature (K). Default: US-standard 450-29 ohm, "
+          "100-250 F sender.")
+      ->set_sort_order(3025);
 
-  a2_voltage->connect_to(
-      new SKOutputFloat("sensors.a2.voltage", "Analog Voltage A2",
-                        new SKMetadata("V", "Analog Voltage A2")));
-  // Example of how to output the distance value to Signal K.
-  // a2_distance->connect_to(
-  //     new SKOutputFloat("sensors.a2.distance", "Analog Distance A2",
-  //                       new SKMetadata("m", "Analog Distance A2")));
+  if (coolant_temp_curve->get_samples().empty()) {
+    // F to K: K = (F - 32) * 5/9 + 273.15
+    coolant_temp_curve->clear_samples();
+    coolant_temp_curve->add_sample(
+        CurveInterpolator::Sample(450.0f, 310.93f));  // 100 F
+    coolant_temp_curve->add_sample(
+        CurveInterpolator::Sample(200.0f, 338.71f));  // 150 F
+    coolant_temp_curve->add_sample(
+        CurveInterpolator::Sample(78.0f, 366.48f));   // 200 F
+    coolant_temp_curve->add_sample(
+        CurveInterpolator::Sample(29.0f, 394.26f));   // 250 F
+  }
+
+  coolant_temp_resistance->connect_to(coolant_temp_curve);
+
+  coolant_temp_resistance->connect_to(new SKOutputFloat(
+      "propulsion.main.coolantTemperature.senderResistance",
+      "/Engine/Coolant Temperature/Sender Resistance SK Path",
+      new SKMetadata("ohm", "Coolant Temperature Sender Resistance")));
+
+  coolant_temp_curve->connect_to(new SKOutputFloat(
+      "propulsion.main.coolantTemperature",
+      "/Engine/Coolant Temperature/SK Path",
+      new SKMetadata("K", "Engine Coolant Temperature")));
 
   ///////////////////////////////////////////////////////////////////
   // Oil pressure sender on analog input A3 (ADS1115 channel 2).
@@ -242,10 +289,10 @@ void setup() {
   constexpr float kOilPressureMeasurementCurrent = 0.01f;  // A
 
   auto oil_pressure_resistance =
-      new RepeatSensor<float>(500, [ads1115]() {
+      new RepeatSensor<float>(500, [ads1115, voltage_divider_scale]() {
         int16_t adc_output = ads1115->readADC_SingleEnded(2);
         float adc_output_volts = ads1115->computeVolts(adc_output);
-        return kVoltageDividerScale * adc_output_volts /
+        return voltage_divider_scale->scale * adc_output_volts /
                kOilPressureMeasurementCurrent;
       });
 
@@ -333,6 +380,13 @@ void setup() {
       ->connect_to(new LambdaTransform<float, double>(
           [](float value) { return static_cast<double>(value); }))
       ->connect_to(engine_dynamic_sender->oil_pressure_);
+
+  // Feed the A2 coolant temperature measurement (K) into the NMEA 2000
+  // dynamic engine parameter sender (PGN 127489) for engine instance 0.
+  coolant_temp_curve
+      ->connect_to(new LambdaTransform<float, double>(
+          [](float value) { return static_cast<double>(value); }))
+      ->connect_to(engine_dynamic_sender->temperature_);
 
   // FIXME: Transmit the alarms over SK as well.
 
