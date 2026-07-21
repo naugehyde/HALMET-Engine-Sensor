@@ -18,18 +18,16 @@ const float kTankDefaultSize = 120. / 1000;
 sensesp::FloatProducer* ConnectTankSender(Adafruit_ADS1115* ads1115,
                                           int channel, const String& name,
                                           const String& sk_id, int sort_order,
-                                          VoltageDividerScale* voltage_divider_scale,
                                           bool enable_signalk_output) {
   const uint ads_read_delay = 500;  // ms
 
   // Configure the sender resistance sensor
 
-  auto sender_resistance = new sensesp::RepeatSensor<float>(
-      ads_read_delay, [ads1115, channel, voltage_divider_scale]() {
+  auto sender_resistance =
+      new sensesp::RepeatSensor<float>(ads_read_delay, [ads1115, channel]() {
         int16_t adc_output = ads1115->readADC_SingleEnded(channel);
         float adc_output_volts = ads1115->computeVolts(adc_output);
-        return voltage_divider_scale->scale * adc_output_volts /
-               kMeasurementCurrent;
+        return kVoltageDividerScale * adc_output_volts / kMeasurementCurrent;
       });
 
   if (enable_signalk_output) {
