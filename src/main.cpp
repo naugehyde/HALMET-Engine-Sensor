@@ -21,8 +21,9 @@
 #include "sensesp/signalk/signalk_output.h"
 #include "sensesp/system/lambda_consumer.h"
 #include "sensesp/system/system_status_led.h"
-#include "sensesp/transforms/curveinterpolator.h"
 #include "sensesp/transforms/lambda_transform.h"
+#include "sensesp/transforms/curveinterpolator.h"
+
 #include "sensesp/transforms/linear.h"
 #include "sensesp/ui/config_item.h"
 #include "sensesp_app_builder.h"
@@ -65,6 +66,14 @@ bool alarm_states[4] = {false, false, false, false};
 
 const adsGain_t kADS1115Gain = GAIN_ONE;
 
+
+// Analog channel map
+const int kFuelSenderChannel = 0;  // A1
+const int kCoolantChannel    = 1;  // A2
+const int kOilChannel        = 2;  // A3
+const int kSupplyChannel     = 3;  // A4  (shared IGN-feed tap)
+ 
+
 /////////////////////////////////////////////////////////////////////
 // Test output pin configuration. If ENABLE_TEST_OUTPUT_PIN is defined,
 // GPIO 33 will output a pulse wave at 380 Hz with a 50% duty cycle.
@@ -95,13 +104,13 @@ void setup() {
   BUILDER_CLASS builder;
   sensesp_app = (&builder)
                     // EDIT: Set a custom hostname for the app.
-                    ->set_hostname("halriot")
+                    ->set_hostname("patricialynn-halmet")
                     // EDIT: Optionally, hard-code the WiFi and Signal K server
                     // settings. This is normally not needed.
                     //->set_wifi("My WiFi SSID", "my_wifi_password")
                     //->set_sk_server("192.168.10.3", 80)
                     // EDIT: Enable OTA updates with a password.
-                    //->enable_ota("my_ota_  word")
+                    //->enable_ota("my_ota_password")
                     ->get_app();
 
   // initialize the I2C bus
@@ -171,170 +180,190 @@ void setup() {
   // Initialize the OLED display
   bool display_present = InitializeSSD1306(sensesp_app->get(), &display, i2c);
 
+    /////////////////////////////////////////////////////////////////////
+  // Ratiometric reader: Vs/Vcc. The 33.3/3.3 front end is identical on both
+  // channels so it cancels; no voltage-divider scale needed. Reads both
+  // channels back-to-back so numerator and denominator are contemporaneous.
+  auto make_ratio_sensor = [ads1115](int sender_channel) {
+    return new RepeatSensor<float>(500, [ads1115, sender_channel]() -> float {
+      float v_sender =
+          ads1115->computeVolts(ads1115->readADC_SingleEnded(sender_channel));
+      float v_supply =
+          ads1115->computeVolts(ads1115->readADC_SingleEnded(kSupplyChannel));
+      if (v_supply <= 0.05f) return NAN;  // key off / no supply
+      return v_sender / v_supply;
+    });
+  };
+  // REGULATED-GAUGE FALLBACK: if the supply-sensitivity test showed Vs steady
+  // while the battery moved, replace a channel's make_ratio_sensor(ch) with a
+  // raw-volts reader and enter recorded Vs (not the ratio) in that curve:
+  //   [ads1115](){ return 10.09f * ads1115->computeVolts(
+  //                    ads1115->readADC_SingleEnded(ch)); }
+ 
   ///////////////////////////////////////////////////////////////////
-  // Analog inputs
-
-  bool enable_signalk_output = true;
-
-  // HALMET's analog inputs share a fixed hardware voltage divider (default
-  // 33.3/3.3). Expose it as a user-configurable value in the web UI in case
-  // a board revision or component tolerances require adjustment.
-  auto voltage_divider_scale =
-      new VoltageDividerScale("/Analog Inputs/Voltage Divider Scale");
-
-  ConfigItem(voltage_divider_scale)
-      ->set_title("Analog Input Voltage Divider Scale")
-      ->set_description(
-          "HALMET analog input hardware voltage divider ratio (default "
-          "33.3/3.3)")
-      ->set_sort_order(2990);
-
-  // Connect the tank senders.
-  // EDIT: To enable more tanks, uncomment the lines below.
-  auto tank_a1_volume =
-      ConnectTankSender(ads1115, 0, "Fuel", "fuel.main", 3000,
-                        voltage_divider_scale, enable_signalk_output);
-  // auto tank_a2_volume = ConnectTankSender(ads1115, 1, "A2", "tanks.a2", 3010, voltage_divider_scale);
-  // auto tank_a3_volume = ConnectTankSender(ads1115, 2, "A3", "tanks.a3", 3020, voltage_divider_scale);
-  // auto tank_a4_volume = ConnectTankSender(ads1115, 3, "A4", "tanks.a4", 3030, voltage_divider_scale);
-
-#ifdef ENABLE_NMEA2000_OUTPUT
-  // Tank 1, instance 0. Capacity 200 liters. You can change the capacity
-  // in the web UI as well.
-  // EDIT: Make sure this matches your tank configuration above.
-  N2kFluidLevelSender* tank_a1_sender = new N2kFluidLevelSender(
-      "/Tanks/Fuel/NMEA 2000", 0, N2kft_Fuel, 200, nmea2000);
-
-  ConfigItem(tank_a1_sender)
-      ->set_title("Tank A1 NMEA 2000")
-      ->set_description("NMEA 2000 tank sender for tank A1")
-      ->set_sort_order(3005);
-
-  tank_a1_volume->connect_to(&(tank_a1_sender->tank_level_));
-#endif  // ENABLE_NMEA2000_OUTPUT
-
-  if (display_present) {
-    // EDIT: Duplicate the lines below to make the display show all your tanks.
-    tank_a1_volume->connect_to(new LambdaConsumer<float>(
-        [](float value) { PrintValue(display, 2, "Tank A1", 100 * value); }));
+  // FUEL  (A1)  ->  level 0..1  ->  volume
+  auto fuel_ratio = make_ratio_sensor(kFuelSenderChannel);
+ 
+  auto fuel_level = (new CurveInterpolator(nullptr, "/Tanks/Fuel/Level Curve"))
+                        ->set_input_title("Sender Ratio (Vs/Vcc)")
+                        ->set_output_title("Fuel Level (ratio)");
+  ConfigItem(fuel_level)
+      ->set_title("Fuel Tank Level Curve")
+      ->set_description("Vs/Vcc ratio -> tank level, calibrated to the OEM gauge.")
+      ->set_sort_order(3000);
+  if (fuel_level->get_samples().empty()) {
+    fuel_level->clear_samples();
+    // CALIBRATE: Sample(Vs/Vcc , level). Replace levels with needle marks.
+    /*
+    12.51	2.87	1
+    12.52	4.55	0.75
+    12.51	5.63	5
+    12.53	6.4	0.25
+    12.51	7.5	0
+    */
+    fuel_level->add_sample(CurveInterpolator::Sample(7.5 / 12.51, 0.00));  // E
+    fuel_level->add_sample(CurveInterpolator::Sample(6.4 / 12.51, 0.25));  // 1/4
+    fuel_level->add_sample(CurveInterpolator::Sample(5.63 / 12.51, 0.50));  // 1/2
+    fuel_level->add_sample(CurveInterpolator::Sample(4.55 / 12.51, 0.75));  // 3/4
+    fuel_level->add_sample(CurveInterpolator::Sample(2.87 / 12.51, 1.00));  // F
   }
-
+  fuel_ratio->connect_to(fuel_level);
+ 
+  auto fuel_volume = new Linear(0.076f, 0.0f, "/Tanks/Fuel/Total Volume");
+  ConfigItem(fuel_volume)
+      ->set_title("Fuel Tank Total Volume")
+      ->set_description("Tank capacity in m3 (0.076 = ~20 US gal)")
+      ->set_sort_order(3002);
+  fuel_level->connect_to(fuel_volume);
+ 
+  fuel_ratio->connect_to(new SKOutputFloat(
+      "tanks.fuel.main.senderRatio", "/Tanks/Fuel/Ratio SK Path",
+      new SKMetadata("ratio", "Fuel sender Vs/Vcc")));
+  fuel_level->connect_to(new SKOutputFloat(
+      "tanks.fuel.main.currentLevel", "/Tanks/Fuel/Level SK Path",
+      new SKMetadata("ratio", "Fuel tank level")));
+  fuel_volume->connect_to(new SKOutputFloat(
+      "tanks.fuel.main.currentVolume", "/Tanks/Fuel/Volume SK Path",
+      new SKMetadata("m3", "Fuel tank volume")));
+ 
+#ifdef ENABLE_NMEA2000_OUTPUT
+  N2kFluidLevelSender* tank_sender = new N2kFluidLevelSender(
+      "/Tanks/Fuel/NMEA 2000", 0, N2kft_Fuel, 120, nmea2000);
+  ConfigItem(tank_sender)
+      ->set_title("Fuel Tank NMEA 2000")
+      ->set_sort_order(3005);
+  fuel_level->connect_to(&(tank_sender->tank_level_));
+#endif
+ 
   ///////////////////////////////////////////////////////////////////
-  // Coolant temperature sender on analog input A2 (ADS1115 channel 1).
-  //
-  // This expects a US-standard resistive temperature sender (Faria /
-  // Stewart-Warner style) with a nominal range of ~450 ohms at 100 F
-  // down to ~29 ohms at 250 F. The HALMET analog front-end drives the
-  // sender with a constant ~10 mA current, so the sender resistance is
-  // computed from the measured voltage.
-  constexpr float kCoolantTempMeasurementCurrent = 0.01f;  // A
-
-  auto coolant_temp_resistance = new RepeatSensor<float>(
-      500, [ads1115, voltage_divider_scale]() {
-        int16_t adc_output = ads1115->readADC_SingleEnded(1);
-        float adc_output_volts = ads1115->computeVolts(adc_output);
-        return voltage_divider_scale->scale * adc_output_volts /
-               kCoolantTempMeasurementCurrent;
-      });
-
-  // Piecewise linear curve mapping sender resistance (ohms) to coolant
-  // temperature (Kelvin). Defaults match a US-standard 450-29 ohm sender
-  // with a 100-250 F range. The curve is editable from the web UI.
+  // COOLANT TEMPERATURE  (A2)  ->  Kelvin
+  auto coolant_ratio = make_ratio_sensor(kCoolantChannel);
+ 
   auto coolant_temp_curve =
       (new CurveInterpolator(nullptr, "/Engine/Coolant Temperature/Curve"))
-          ->set_input_title("Sender Resistance (ohms)")
+          ->set_input_title("Sender Ratio (Vs/Vcc)")
           ->set_output_title("Coolant Temperature (K)");
-
   ConfigItem(coolant_temp_curve)
       ->set_title("Coolant Temperature Curve")
-      ->set_description(
-          "Piecewise linear curve mapping sender resistance (ohms) to "
-          "coolant temperature (K). Default: US-standard 450-29 ohm, "
-          "100-250 F sender.")
+      ->set_description("Vs/Vcc ratio -> coolant temp (K), calibrated to the OEM gauge.")
       ->set_sort_order(3025);
-
   if (coolant_temp_curve->get_samples().empty()) {
-    // F to K: K = (F - 32) * 5/9 + 273.15
     coolant_temp_curve->clear_samples();
-    coolant_temp_curve->add_sample(
-        CurveInterpolator::Sample(450.0f, 310.93f));  // 100 F
-    coolant_temp_curve->add_sample(
-        CurveInterpolator::Sample(200.0f, 338.71f));  // 150 F
-    coolant_temp_curve->add_sample(
-        CurveInterpolator::Sample(78.0f, 366.48f));   // 200 F
-    coolant_temp_curve->add_sample(
-        CurveInterpolator::Sample(29.0f, 394.26f));   // 250 F
+    // CALIBRATE: Sample(Vs/Vcc , Kelvin).  K = (F-32)*5/9 + 273.15
+    // Fill ratios at the gauge's F marks; cluster near 160-200F.
+    /*
+    12.51	1.85	120
+    12.51	2.4	    100
+    12.51	3.24	80
+    12.51	4.57	60
+    12.51	5.85	40
+    */
+
+     coolant_temp_curve->add_sample(CurveInterpolator::Sample(5.85/12.51, 40+273.15)); 
+     coolant_temp_curve->add_sample(CurveInterpolator::Sample(4.57/12.51, 60+273.15));
+     coolant_temp_curve->add_sample(CurveInterpolator::Sample(3.24/12.51, 80+273.15));
+     coolant_temp_curve->add_sample(CurveInterpolator::Sample(2.4/12.51,  100+273.15));     
+     coolant_temp_curve->add_sample(CurveInterpolator::Sample(1.85/12.51, 120+273.15)); 
+
   }
-
-  coolant_temp_resistance->connect_to(coolant_temp_curve);
-
-  coolant_temp_resistance->connect_to(new SKOutputFloat(
-      "propulsion.main.coolantTemperature.senderResistance",
-      "/Engine/Coolant Temperature/Sender Resistance SK Path",
-      new SKMetadata("ohm", "Coolant Temperature Sender Resistance")));
-
+  coolant_ratio->connect_to(coolant_temp_curve);
+ 
+  coolant_ratio->connect_to(new SKOutputFloat(
+      "propulsion.main.coolantTemperature.senderRatio",
+      "/Engine/Coolant Temperature/Ratio SK Path",
+      new SKMetadata("ratio", "Coolant sender Vs/Vcc")));
   coolant_temp_curve->connect_to(new SKOutputFloat(
       "propulsion.main.coolantTemperature",
       "/Engine/Coolant Temperature/SK Path",
       new SKMetadata("K", "Engine Coolant Temperature")));
-
+ 
   ///////////////////////////////////////////////////////////////////
-  // Oil pressure sender on analog input A3 (ADS1115 channel 2).
-  //
-  // This expects a US-standard resistive oil pressure sender (VDO /
-  // Stewart-Warner style) with a nominal range of 240 ohms at 0 psi
-  // down to ~33 ohms at 80 psi. The HALMET analog front-end drives the
-  // sender with a constant ~10 mA current, so the sender resistance is
-  // computed from the measured voltage.
-  constexpr float kOilPressureMeasurementCurrent = 0.01f;  // A
-
-  auto oil_pressure_resistance =
-      new RepeatSensor<float>(500, [ads1115, voltage_divider_scale]() {
-        int16_t adc_output = ads1115->readADC_SingleEnded(2);
-        float adc_output_volts = ads1115->computeVolts(adc_output);
-        return voltage_divider_scale->scale * adc_output_volts /
-               kOilPressureMeasurementCurrent;
-      });
-
-  // Piecewise linear curve mapping sender resistance (ohms) to oil
-  // pressure (Pa). Defaults match a US-standard 240-33 ohm sender with
-  // a linear 0-80 psi range. The curve is editable from the web UI.
-  auto oil_pressure_curve = (new CurveInterpolator(
-                                 nullptr, "/Engine/Oil Pressure/Curve"))
-                                ->set_input_title("Sender Resistance (ohms)")
-                                ->set_output_title("Oil Pressure (Pa)");
-
+  // OIL PRESSURE  (A3)  ->  Pascals
+  auto oil_ratio = make_ratio_sensor(kOilChannel);
+ 
+  auto oil_pressure_curve =
+      (new CurveInterpolator(nullptr, "/Engine/Oil Pressure/Curve"))
+          ->set_input_title("Sender Ratio (Vs/Vcc)")
+          ->set_output_title("Oil Pressure (Pa)");
   ConfigItem(oil_pressure_curve)
       ->set_title("Oil Pressure Curve")
-      ->set_description(
-          "Piecewise linear curve mapping sender resistance (ohms) to oil "
-          "pressure (Pa). Default: US-standard 240-33 ohm, 0-80 psi sender.")
+      ->set_description("Vs/Vcc ratio -> oil pressure (Pa), calibrated to the OEM gauge.")
       ->set_sort_order(3020);
-
   if (oil_pressure_curve->get_samples().empty()) {
-    // psi to Pa: 1 psi = 6894.757 Pa
     oil_pressure_curve->clear_samples();
-    oil_pressure_curve->add_sample(
-        CurveInterpolator::Sample(240.0f, 0.0f));
-    oil_pressure_curve->add_sample(
-        CurveInterpolator::Sample(103.0f, 40.0f * 6894.757f));
-    oil_pressure_curve->add_sample(
-        CurveInterpolator::Sample(33.0f, 80.0f * 6894.757f));
-    oil_pressure_curve->add_sample(
-        CurveInterpolator::Sample(0.0f, 100.0f * 6894.757f));
+    // CALIBRATE: Sample(Vs/Vcc , Pa).  1 psi = 6894.757 Pa
+    /*12.51	2.64	500
+12.51	4.45	375
+12.51	5.5	250
+12.51	6.2	125
+12.51	7.5	0*/
+    oil_pressure_curve->add_sample(CurveInterpolator::Sample(7.5/12.51,  0.0f));          
+    oil_pressure_curve->add_sample(CurveInterpolator::Sample(6.2/12.51,  125.0f*1000.0f*0.145f));          
+    oil_pressure_curve->add_sample(CurveInterpolator::Sample(5.5/12.51,  250.0f*1000.0f*0.145f));          
+    oil_pressure_curve->add_sample(CurveInterpolator::Sample(4.45/12.51,  375.0f*1000.0f*0.145f));          
+    oil_pressure_curve->add_sample(CurveInterpolator::Sample(2.64/12.51,  500.0f*1000.0f*0.145f));          
   }
-
-  oil_pressure_resistance->connect_to(oil_pressure_curve);
-
-  // Publish raw sender resistance and converted pressure to Signal K.
-  oil_pressure_resistance->connect_to(new SKOutputFloat(
-      "propulsion.main.oilPressure.senderResistance",
-      "/Engine/Oil Pressure/Sender Resistance SK Path",
-      new SKMetadata("ohm", "Oil Pressure Sender Resistance")));
-
+  oil_ratio->connect_to(oil_pressure_curve);
+ 
+  oil_ratio->connect_to(new SKOutputFloat(
+      "propulsion.main.oilPressure.senderRatio",
+      "/Engine/Oil Pressure/Ratio SK Path",
+      new SKMetadata("ratio", "Oil sender Vs/Vcc")));
   oil_pressure_curve->connect_to(new SKOutputFloat(
       "propulsion.main.oilPressure", "/Engine/Oil Pressure/SK Path",
       new SKMetadata("Pa", "Engine Oil Pressure")));
+ 
+  
+  // Helper to create a voltage reader for an ADS1115 channel and A-slot.
+  auto make_voltage_input = [&](int channel) {
+    const int a_slot = channel + 1;  // A1 = slot 1, A2 = slot 2, etc.
+    const String config_path = String("/Voltage A") + String(a_slot);
+    auto sensor = new ADS1115VoltageInput(ads1115, channel, config_path);
+
+    ConfigItem(sensor)
+        ->set_title(String("Analog Voltage A") + String(a_slot))
+        ->set_description(String("Voltage level of analog input A") + String(a_slot))
+        ->set_sort_order(3000 + a_slot);
+
+    sensor->connect_to(new LambdaConsumer<float>([a_slot](float value) {
+      debugD("Voltage A%d: %f", a_slot, value);
+    }));
+
+    if (sensor->reporting_enabled()) {
+      const String sk_path = String("sensors.halmet.a") + String(a_slot) + ".voltage";
+      sensor->connect_to(new SKOutputFloat(sk_path.c_str(), (String("Analog Voltage A") + String(a_slot)).c_str(),
+                                           new SKMetadata("V", (String("Analog Voltage A") + String(a_slot)).c_str())));
+    }
+
+    return sensor;
+  };
+
+  // Read the voltage level of analog input A2
+  auto a1_voltage = make_voltage_input(0);
+  auto a2_voltage = make_voltage_input(1);
+  auto a3_voltage = make_voltage_input(2);
+  auto a4_voltage = make_voltage_input(3);
+
 
   ///////////////////////////////////////////////////////////////////
   // Digital alarm inputs
@@ -373,20 +402,6 @@ void setup() {
   // This is just an example -- normally temperature alarms would not be
   // active-low (inverted).
   alarm_d3_inverted->connect_to(engine_dynamic_sender->over_temperature_);
-
-  // Feed the A3 oil pressure measurement (Pa) into the NMEA 2000
-  // dynamic engine parameter sender (PGN 127489) for engine instance 0.
-  oil_pressure_curve
-      ->connect_to(new LambdaTransform<float, double>(
-          [](float value) { return static_cast<double>(value); }))
-      ->connect_to(engine_dynamic_sender->oil_pressure_);
-
-  // Feed the A2 coolant temperature measurement (K) into the NMEA 2000
-  // dynamic engine parameter sender (PGN 127489) for engine instance 0.
-  coolant_temp_curve
-      ->connect_to(new LambdaTransform<float, double>(
-          [](float value) { return static_cast<double>(value); }))
-      ->connect_to(engine_dynamic_sender->temperature_);
 
   // FIXME: Transmit the alarms over SK as well.
 
